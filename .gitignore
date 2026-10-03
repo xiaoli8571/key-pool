@@ -1,0 +1,15 @@
+# 运行数据（含真实密钥，绝不入库）
+data/
+deploy/state.json
+deploy/ssh.env
+
+# 本机辅助脚本（含本机绝对路径，公开仓库不需要）
+tools/
+
+# Node / 编辑器杂项
+node_modules/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+Thumbs.db

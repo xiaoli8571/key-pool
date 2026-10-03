@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>KeyPool · API Key 轮换池</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #1c2330; --border: #2d333b;
+    --text: #e6edf3; --muted: #8b949e; --accent: #4f8ef7; --ok: #3fb950; --warn: #d29922; --err: #f85149; --cool: #8957e5;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
+  a { color: var(--accent); text-decoration: none; }
+  header { display: flex; align-items: center; gap: 14px; padding: 12px 20px; background: var(--bg2); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+  header .spacer { flex: 1; }
+  header .host { color: var(--muted); font-family: Consolas, monospace; font-size: 12px; }
+  nav button { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  nav button.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+  main { max-width: 1180px; margin: 0 auto; padding: 18px 20px 80px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .stat { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .stat .v { font-size: 22px; font-weight: 700; }
+  .stat .l { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .panel { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 10px; }
+  .panel h2 .hint { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .row > * { flex-shrink: 0; }
+  input, select, textarea {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 8px;
+    padding: 7px 10px; font-size: 13px; font-family: inherit;
+  }
+  textarea { font-family: Consolas, monospace; width: 100%; resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  button.btn { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; font-weight: 600; }
+  button.btn:hover { filter: brightness(1.1); }
+  button.btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); font-weight: 400; }
+  button.btn.danger { background: transparent; border: 1px solid var(--err); color: var(--err); font-weight: 400; }
+  button.btn.small { padding: 4px 10px; font-size: 12px; }
+  .chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+  .model-pool { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; max-height: 148px; overflow: auto; padding: 2px; }
+  .mp { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; cursor: pointer; background: var(--bg2); color: var(--text); }
+  .mp:hover { border-color: var(--accent); color: var(--accent); }
+  .mp.nonchat { opacity: .55; }
+  .mp em { font-style: normal; font-size: 10px; padding: 0 5px; border-radius: 999px; background: var(--bg3); color: var(--muted); }
+  .chip.ok { background: rgba(63,185,80,.15); color: var(--ok); }
+  .chip.cooling { background: rgba(137,87,229,.18); color: var(--cool); }
+  .chip.disabled { background: rgba(248,81,73,.14); color: var(--err); }
+  .chip.gray { background: rgba(139,148,158,.15); color: var(--muted); }
+  .badge { font-size: 11px; padding: 2px 7px; border-radius: 5px; background: var(--bg3); color: var(--muted); border: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--muted); font-size: 12px; font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid rgba(45,51,59,.5); font-size: 13px; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  td.key code { font-family: Consolas, monospace; font-size: 12px; background: var(--bg); padding: 2px 6px; border-radius: 5px; }
+  .err-note { color: var(--err); font-size: 12px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .target-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 14px; overflow: hidden; }
+  .target-head { display: flex; align-items: center; gap: 12px; padding: 13px 16px; cursor: pointer; flex-wrap: wrap; }
+  .target-head .name { font-weight: 700; font-size: 15px; }
+  .target-head .url { color: var(--muted); font-family: Consolas, monospace; font-size: 12px; }
+  .target-head .grow { flex: 1; }
+  .target-body { border-top: 1px solid var(--border); padding: 14px 16px; display: none; }
+  .target-card.open .target-body { display: block; }
+  .log-line { font-family: Consolas, monospace; font-size: 12.5px; padding: 4px 8px; border-bottom: 1px solid rgba(45,51,59,.4); display: flex; gap: 10px; }
+  .log-line .t { color: var(--muted); flex-shrink: 0; }
+  .log-line.info .m { color: var(--text); } .log-line.warn .m { color: var(--warn); } .log-line.error .m { color: var(--err); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
+  .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  .field input, .field select { width: 100%; }
+  .section-title { font-size: 13px; font-weight: 700; color: var(--muted); margin: 16px 0 8px; text-transform: uppercase; letter-spacing: .4px; }
+  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; z-index: 100; }
+  .modal-mask.show { display: flex; }
+  .modal { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 22px; width: min(520px, 92vw); max-height: 88vh; overflow: auto; }
+  .modal h3 { margin: 0 0 14px; }
+  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 10px 18px; border-radius: 10px; font-size: 13px; z-index: 200; display: none; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+  .switch { position: relative; width: 36px; height: 20px; display: inline-block; }
+  .switch input { display: none; }
+  .switch i { position: absolute; inset: 0; background: var(--bg3); border: 1px solid var(--border); border-radius: 999px; cursor: pointer; transition: .15s; }
+  .switch i::after { content: ""; position: absolute; width: 14px; height: 14px; border-radius: 50%; background: var(--muted); top: 2px; left: 2px; transition: .15s; }
+  .switch input:checked + i { background: rgba(79,142,247,.35); border-color: var(--accent); }
+  .switch input:checked + i::after { left: 18px; background: var(--accent); }
+  .empty { color: var(--muted); text-align: center; padding: 30px 0; }
+  .code-block { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-family: Consolas, monospace; font-size: 12px; overflow-x: auto; white-space: pre; color: #9ecbff; }
+  .muted { color: var(--muted); font-size: 12px; }
+  #loginView { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  #loginView .card { width: min(380px, 90vw); }
+</style>
+</head>
+<body>
+<div id="loginView">
+  <div class="panel card" style="width:min(380px,90vw)">
+    <h2 style="margin-bottom:4px">🔐 <span id="loginTitle">登录管理后台</span></h2>
+    <p class="muted" id="loginHint" style="margin-top:0">首次使用请设置管理密码</p>
+    <div class="field"><label>管理密码</label><input type="password" id="loginPwd" placeholder="至少 6 位" /></div>
+    <button class="btn" style="width:100%" onclick="doLogin()">进入</button>
+  </div>
+</div>
+
+<div id="appView" style="display:none">
+  <header>
+    <h1>🔑 Key<span>Pool</span></h1>
+    <span class="badge" id="verBadge">v1.0</span>
+    <div class="spacer"></div>
+    <span class="host" id="hostInfo"></span>
+    <span class="muted" id="autoInfo" style="font-size:11px"></span>
+    <nav>
+      <button data-tab="targets" class="active" onclick="switchTab('targets')">渠道与密钥</button>
+      <button data-tab="settings" onclick="switchTab('settings')">设置</button>
+      <button data-tab="logs" onclick="switchTab('logs')">日志</button>
+      <button data-tab="help" onclick="switchTab('help')">接入说明</button>
+    </nav>
+    <button class="btn ghost small" onclick="openPwd()">修改密码</button>
+    <button class="btn ghost small" onclick="logout()">退出</button>
+  </header>
+  <main>
+    <div class="stats" id="statBar"></div>
+
+    <!-- 渠道 -->
+    <div id="tab-targets">
+      <div class="panel">
+        <h2>添加渠道（平台）<span class="hint">自定义 Base URL，支持 OpenAI / Anthropic / Gemini / Azure 等任何兼容平台</span></h2>
+        <div class="grid2">
+          <div>
+            <div class="field"><label>名称</label><input id="ntName" placeholder="例如：tierflow 官方" /></div>
+            <div class="field"><label>类型</label>
+              <select id="ntType">
+                <option value="openai">OpenAI 兼容（/v1/chat/completions）</option>
+                <option value="anthropic">Anthropic（/v1/messages）</option>
+                <option value="gemini">Google Gemini</option>
+                <option value="azure">Azure OpenAI</option>
+              </select>
+            </div>
+            <div class="field"><label>Base URL</label><input id="ntBase" placeholder="https://tierflow.cn/v1" /></div>
+          </div>
+          <div>
+            <div class="field"><label>API Keys（每行一个，可带备注："sk-xxx 账号A" 或 "sk-xxx|账号A|优先级"）<span id="ntParse" class="muted" style="margin-left:8px"></span></label>
+              <textarea id="ntKeys" rows="6" placeholder="sk-xxxxxx&#10;sk-yyyyyy|账号B|10" oninput="parseCount('ntKeys','ntParse')"></textarea>
+            </div>
+            <div class="field"><label>备注（可选）</label><input id="ntNote" placeholder="" /></div>
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn" onclick="addTarget()">＋ 添加渠道</button>
+          <span class="muted">提示：Base URL 填到域名或 /v1 均可（如 https://api.example.com 或 https://tierflow.cn/v1）</span>
+        </div>
+      </div>
+      <div id="targetList"></div>
+    </div>
+
+    <!-- 设置 -->
+    <div id="tab-settings" style="display:none">
+      <div class="panel">
+        <h2>轮换策略</h2>
+        <div class="grid2">
+          <div>
+            <div class="field"><label>轮换策略</label>
+              <select id="sStrategy">
+                <option value="round-robin">轮询（最久未用优先）</option>
+                <option value="priority">优先级（数字大优先，同级轮询）</option>
+              </select>
+            </div>
+            <div class="field"><label>429 冷却基数（秒，指数退避）</label><input id="sRate" type="number" min="1" /></div>
+            <div class="field"><label>单 Key 最大并发（0 = 不限制）</label><input id="sMaxC" type="number" min="0" /></div>
+            <div class="field"><label>5xx 冷却（秒）</label><input id="sServer" type="number" min="1" /></div>
+            <div class="field"><label>超时/网络错误冷却（秒）</label><input id="sNetwork" type="number" min="1" /></div>
+            <div class="field"><label>欠费/额度耗尽冷却（分钟）</label><input id="sBilling" type="number" min="1" /></div>
+          </div>
+          <div>
+            <div class="field"><label>单请求最大轮换尝试次数</label><input id="sMaxAttempts" type="number" min="1" max="50" /></div>
+            <div class="field"><label>请求超时（秒）</label><input id="sTimeout" type="number" min="1" /></div>
+            <div class="field"><label>流式空闲超时（秒）</label><input id="sIdle" type="number" min="5" /></div>
+            <div class="field"><label>欠费判定关键词（逗号分隔）</label><input id="sBillingKw" /></div>
+            <div class="field"><label>请求体大小上限（MB）</label><input id="sMaxBody" type="number" min="1" /></div>
+          </div>
+        </div>
+        <div class="field"><label>网关访问密钥（客户端调用 KeyPool 时用的 key，每行一个；留空 = 不鉴权。与上游 API Key 无关）</label>
+          <textarea id="sApiKeys" rows="3" placeholder="agent-secret-key-1&#10;agent-secret-key-2"></textarea>
+        </div>
+        <div class="row">
+          <button class="btn" onclick="saveSettings()">保存设置</button>
+          <button class="btn ghost" onclick="exportConfig()">导出配置（备份）</button>
+          <button class="btn ghost" onclick="$('importFile').click()">导入配置</button>
+          <input type="file" id="importFile" accept=".json" style="display:none" onchange="importConfig(this)" />
+          <span class="muted">并发策略：最少并发优先 + 单 Key 并发上限；429 遵循上游 Retry-After</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 日志 -->
+    <div id="tab-logs" style="display:none">
+      <div class="panel">
+        <h2>运行日志<button class="btn ghost small" onclick="loadLogs()">刷新</button></h2>
+        <div id="logList"></div>
+      </div>
+    </div>
+
+    <!-- 帮助 -->
+    <div id="tab-help" style="display:none">
+      <div class="panel">
+        <h2>Agent / 客户端接入</h2>
+        <p>把 Agent 的 API 地址改为本服务即可，所有请求会自动在多个密钥间轮换：</p>
+        <div class="code-block" id="helpCode"></div>
+        <p class="muted">响应头 <code>x-keypool-target</code> / <code>x-keypool-key</code> 显示本次实际使用的渠道与密钥；429/5xx/超时会自动换下一个密钥重试；所有密钥都在冷却时返回 429 + Retry-After。</p>
+        <p class="muted">也支持 Anthropic 协议 <code>POST /v1/messages</code>（x-api-key 头）与 Gemini 原生路径 <code>/v1beta/*</code>。</p>
+        <div class="section-title">🔐 渠道专属 Key</div>
+        <p style="margin:4px 0">在每个渠道里可以生成<b>专属 Key</b>（自动生成 <code>kp-渠道名-xxxx</code> 或手动填写）。把它填进 Agent 后，该 Agent 的请求<b>只会路由到这个渠道</b>，看不到其他渠道和模型；并独立统计请求数。适合"一个渠道发一个 Agent"的隔离场景。全局网关密钥（设置页）则可访问所有渠道。</p>
+        <div class="code-block" id="helpScopedCode"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="modal-mask" id="editMask">
+  <div class="modal">
+    <h3>编辑渠道</h3>
+    <div class="field"><label>名称</label><input id="etName" /></div>
+    <div class="field"><label>类型</label>
+      <select id="etType" onchange="if(this.value!=='openai')$('etAcceptAnthr').closest('.field').style.display='none';else $('etAcceptAnthr').closest('.field').style.display='';$('etAcceptAnthr').checked=this.value==='openai'?$('etAcceptAnthr').checked:false">
+        <option value="openai">OpenAI 兼容</option>
+        <option value="anthropic">Anthropic</option>
+        <option value="gemini">Gemini</option>
+        <option value="azure">Azure OpenAI</option>
+      </select>
+    </div>
+    <div class="field"><label>Base URL</label><input id="etBase" /></div>
+    <div class="field"><label>测试模型（可选，用于连通性测试回退）</label><input id="etTestModel" placeholder="gpt-4o-mini" /></div>
+    <div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="etAcceptAnthr" style="width:auto" /> 同时接受 Anthropic 协议（/v1/messages）
+    </label>
+    <div class="muted" style="font-size:12px;margin-top:4px">适用于原生暴露 /v1/messages 的 OpenAI 兼容平台（如 tierflow、SenseAudio），可让 Claude 类客户端直接用本渠道的专属 Key</div></div>
+    <div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="etChatOnly" style="width:auto" /> 网关模型列表只保留对话模型
+    </label>
+    <div class="muted" style="font-size:12px;margin-top:4px">过滤上游标记为非对话的模型（TTS/ASR/图像等）；模型池与 /v1/models?all=1 仍显示全部</div></div>
+    <div class="field"><label>备注</label><input id="etNote" /></div>
+    <div class="row" style="justify-content:flex-end">
+      <button class="btn ghost" onclick="closeEdit()">取消</button>
+      <button class="btn" onclick="saveEdit()">保存</button>
+    </div>
+  </div>
+</div>
+<div class="modal-mask" id="pwdMask">
+  <div class="modal">
+    <h3>修改管理密码</h3>
+    <div class="field"><label>当前密码</label><input type="password" id="pwdOld" /></div>
+    <div class="field"><label>新密码（至少 6 位）</label><input type="password" id="pwdNew" /></div>
+    <div class="field"><label>确认新密码</label><input type="password" id="pwdNew2" /></div>
+    <div class="row" style="justify-content:flex-end">
+      <button class="btn ghost" onclick="closePwd()">取消</button>
+      <button class="btn" onclick="doChangePwd()">确认修改</button>
+    </div>
+    <p class="muted" style="margin-bottom:0">修改成功后当前浏览器自动换用新令牌，其他已登录会话将失效。</p>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let TOKEN = localStorage.getItem('kp_token') || '';
+let targets = [], states = {}, editId = null, autoTimer = null;
+const openedTargets = new Set(); // 展开状态跨刷新保留
+function toggleTargetOpen(id) {
+  const el = document.getElementById('tc-' + id);
+  if (!el) return;
+  if (el.classList.contains('open')) { el.classList.remove('open'); openedTargets.delete(id); }
+  else { el.classList.add('open'); openedTargets.add(id); }
+}
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? 'var(--err)' : 'var(--border)';
+  t.style.display = 'block';
+  clearTimeout(t._tm);
+  t._tm = setTimeout(() => (t.style.display = 'none'), 2600);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, Object.assign({
+    headers: Object.assign({ 'content-type': 'application/json', 'x-admin-token': TOKEN }, opts.headers || {}),
+  }, opts));
+  let j = null;
+  try { j = await res.json(); } catch {}
+  if (res.status === 401) { showLogin(); throw new Error((j && j.error && j.error.message) || 'unauthorized'); }
+  if (!res.ok) throw new Error((j && j.error && j.error.message) || res.status);
+  return j;
+}
+
+/* ---------------- 登录 ---------------- */
+async function doLogin() {
+  const pwd = $('loginPwd').value;
+  if (!pwd) return toast('请输入密码', true);
+  try {
+    const r = await fetch('/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: pwd }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error.message);
+    TOKEN = j.token;
+    localStorage.setItem('kp_token', TOKEN);
+    enterApp();
+  } catch (e) { toast(e.message, true); }
+}
+function logout() { localStorage.removeItem('kp_token'); location.reload(); }
+function showLogin() { $('loginView').style.display = 'flex'; $('appView').style.display = 'none'; $('loginTitle').textContent = '登录管理后台'; $('loginHint').textContent = '请输入管理密码'; }
+function enterApp() {
+  $('loginView').style.display = 'none';
+  $('appView').style.display = 'block';
+  $('hostInfo').textContent = location.host;
+  refreshAll();
+  clearInterval(autoTimer);
+  autoTimer = setInterval(() => { refreshStats(); refreshKeyStates(); }, 5000);
+}
+
+/* ---------------- 数据加载 ---------------- */
+async function refreshStats() {
+  try {
+    const o = await api('/admin/api/overview');
+    $('statBar').innerHTML = `
+      <div class="stat"><div class="v">${o.targets}</div><div class="l">渠道（启用 ${o.enabledTargets}）</div></div>
+      <div class="stat"><div class="v" style="color:var(--ok)">${o.keys.ok}</div><div class="l">可用密钥</div></div>
+      <div class="stat"><div class="v" style="color:var(--cool)">${o.keys.cooling}</div><div class="l">冷却中</div></div>
+      <div class="stat"><div class="v" style="color:var(--err)">${o.keys.disabled}</div><div class="l">已禁用</div></div>
+      <div class="stat"><div class="v">${o.gatewayKeys}</div><div class="l">专属 Key（累计请求 ${fmtNum(o.gatewayKeyRequests)}）</div></div>
+      <div class="stat"><div class="v" style="color:var(--accent)">${o.concurrent||0}</div><div class="l">当前并发（峰值 ${o.peakConcurrent||0}）</div></div>
+      <div class="stat"><div class="v">${o.totalRequests}</div><div class="l">总请求（成功 ${o.totalSuccess} / 失败 ${o.totalFail}）</div></div>
+      <div class="stat"><div class="v">${o.rpm}</div><div class="l">近 1 分钟成功</div></div>
+      <div class="stat"><div class="v">${fmtNum(o.promptTokens + o.completionTokens)}</div><div class="l">Tokens（入 ${fmtNum(o.promptTokens)} / 出 ${fmtNum(o.completionTokens)}）</div></div>`;
+    window.__lastRefresh = new Date();
+    const ai = $('autoInfo');
+    if (ai) ai.textContent = '自动刷新中 · ' + fmtTime(window.__lastRefresh);
+  } catch {}
+}
+function fmtNum(n) { n = Number(n)||0; return n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n); }
+function fmtTime(ts) { if (!ts) return '—'; const d = new Date(ts); const p = (x) => String(x).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; }
+
+async function loadTargets() {
+  const r = await api('/admin/api/targets');
+  targets = r.targets;
+  renderTargets();
+}
+async function refreshKeyStates() {
+  try {
+    const r = await api('/admin/api/keystates');
+    states = {};
+    for (const s of r.states) states[s.keyId] = s;
+    renderTargets();
+  } catch {}
+}
+function refreshAll() { refreshStats(); loadTargets().then(refreshKeyStates).catch(()=>{}); if (curTab === 'logs') loadLogs(); }
+
+/* ---------------- 渠道渲染 ---------------- */
+function statusOf(keyId, enabled) {
+  if (enabled === false) return { cls: 'disabled', text: '已禁用' };
+  const s = states[keyId];
+  if (!s) return { cls: 'gray', text: '未使用' };
+  if (s.status === 'cooling') return { cls: 'cooling', text: `冷却 ${s.coolingInSec}s`, until: s.coolingUntil };
+  if (s.status === 'disabled') return { cls: 'disabled', text: '已禁用(401/403)' };
+  return { cls: 'ok', text: '可用' };
+}
+
+// 冷却倒计时每秒走动（无需等 5s 轮询）
+setInterval(() => {
+  document.querySelectorAll('[data-cool-until]').forEach((el) => {
+    const until = parseInt(el.dataset.coolUntil, 10);
+    const left = Math.ceil((until - Date.now()) / 1000);
+    el.textContent = left > 0 ? `冷却 ${left}s` : '可用(恢复中)';
+  });
+}, 1000);
+
+function renderTargets() {
+  const box = $('targetList');
+  if (!targets.length) { box.innerHTML = '<div class="panel empty">还没有渠道，请在上方添加。Base URL 如：https://tierflow.cn/v1</div>'; return; }
+  // 记住展开状态与正在输入的内容/光标，重建后恢复（5s 自动刷新不再打断操作）
+  const active = document.activeElement;
+  const focusId = active && active.id && box.contains(active) ? active.id : null;
+  let selStart = 0, selEnd = 0;
+  if (focusId && 'selectionStart' in active) { selStart = active.selectionStart; selEnd = active.selectionEnd; }
+  const saved = {};
+  box.querySelectorAll('textarea[id], input[id]').forEach((el) => { saved[el.id] = el.value; });
+
+  box.innerHTML = targets.map((t) => {
+    const keysHtml = (t.keys || []).map((k) => {
+      const st = statusOf(k.id, k.enabled);
+      const s = states[k.id] || {};
+      const chip = `<span class="chip ${st.cls}"${st.until ? ` data-cool-until="${st.until}"` : ''}>${st.text}</span>`;
+      return `<tr>
+        <td class="key"><code title="${esc(k.key)}" onclick="copyText('${esc(k.key)}')" style="cursor:pointer">${esc(k.key.length > 18 ? k.key.slice(0,10)+'…'+k.key.slice(-4) : k.key)}</code>${k.note ? `<div class="muted">${esc(k.note)}</div>` : ''}</td>
+        <td>${chip}</td>
+        <td style="color:${(s.inFlight||0) > 0 ? 'var(--accent)' : 'inherit'}">${s.inFlight||0}</td>
+        <td><input type="number" value="${k.priority||0}" style="width:64px" onchange="updateKey('${t.id}','${k.id}',{priority:parseInt(this.value)||0})" title="优先级（策略为“优先级”时生效）"/></td>
+        <td>${s.requests||0} / <span style="color:var(--ok)">${s.success||0}</span> / <span style="color:var(--err)">${s.fail||0}</span></td>
+        <td>${fmtNum((s.promptTokens||0)+(s.completionTokens||0))}</td>
+        <td><div class="err-note" title="${esc(s.lastError||'')}">${esc(s.lastError || (s.lastStatus ? 'HTTP '+s.lastStatus : '—'))}</div></td>
+        <td>
+          <label class="switch" title="启用/禁用"><input type="checkbox" ${k.enabled!==false?'checked':''} onchange="updateKey('${t.id}','${k.id}',{enabled:this.checked})" /><i></i></label>
+        </td>
+        <td style="white-space:nowrap">
+          <button class="btn ghost small" onclick="testKey('${t.id}','${k.id}')">测试</button>
+          <button class="btn danger small" onclick="delKey('${t.id}','${k.id}')">删除</button>
+        </td>
+      </tr>`;
+    }).join('');
+    const gwHtml = (t.gatewayKeys || []).map((g) => {
+      const stt = g.enabled === false ? '<span class="chip disabled">已禁用</span>' : '<span class="chip ok">启用中</span>';
+      const s = g.stats || {};
+      return `<tr>
+        <td class="key"><code title="${esc(g.key)}" onclick="copyText('${esc(g.key)}')" style="cursor:pointer">${esc(g.key.length > 26 ? g.key.slice(0,16)+'…'+g.key.slice(-4) : g.key)}</code>${g.note ? `<div class="muted">${esc(g.note)}</div>` : ''}</td>
+        <td>${stt}</td>
+        <td>${s.requests||0} / <span style="color:var(--ok)">${s.success||0}</span> / <span style="color:var(--err)">${s.fail||0}</span></td>
+        <td class="muted">${s.lastUsed ? fmtTime(s.lastUsed) : '—'}</td>
+        <td style="white-space:nowrap">
+          <label class="switch" title="启用/禁用"><input type="checkbox" ${g.enabled!==false?'checked':''} onchange="updateGatewayKey('${t.id}','${g.id}',{enabled:this.checked})" /><i></i></label>
+          <button class="btn ghost small" onclick="regenGatewayKey('${t.id}','${g.id}')" title="重新生成随机 Key，旧 Key 立即失效">重新生成</button>
+          <button class="btn danger small" onclick="delGatewayKey('${t.id}','${g.id}')">删除</button>
+        </td>
+      </tr>`;
+    }).join('');
+    const stSum = (t.keys||[]).reduce((a,k)=>{ const c=statusOf(k.id,k.enabled).cls; a[c]=(a[c]||0)+1; return a; },{});
+    return `<div class="target-card${openedTargets.has(t.id) ? ' open' : ''}" id="tc-${t.id}">
+      <div class="target-head" onclick="toggleTargetOpen('${t.id}')">
+        <span class="name">${esc(t.name)}</span>
+        <span class="badge">${esc(t.type)}</span>
+        ${t.enabled===false?'<span class="chip disabled">渠道已禁用</span>':''}
+        <span class="url">${esc(t.baseUrl)}</span>
+        <span class="grow"></span>
+        <span class="chip ok">可用 ${stSum.ok||0}</span>
+        <span class="chip cooling">冷却 ${stSum.cooling||0}</span>
+        <span class="chip disabled">禁用 ${stSum.disabled||0}</span>
+        ${(t.gatewayKeys||[]).length ? `<span class="chip gray" title="专属 Key（启用/总数）">🔑 ${(t.gatewayKeys||[]).filter((g) => g.enabled !== false).length}/${t.gatewayKeys.length}</span>` : ''}
+      </div>
+      <div class="target-body" onclick="event.stopPropagation()">
+        ${t.keys.length ? `<table>
+          <tr><th>上游密钥（点击复制）</th><th>状态</th><th>并发</th><th>优先级</th><th>请求/成功/失败</th><th>Tokens</th><th>最近错误</th><th>启用</th><th>操作</th></tr>
+          ${keysHtml}</table>` : '<div class="empty" style="padding:14px">暂无上游密钥</div>'}
+        <div class="row" style="margin-top:12px">
+          <textarea id="keys-${t.id}" rows="2" placeholder="批量追加上游密钥，每行一个（可带备注：sk-xxx 账号A）" style="flex:1;min-width:260px" oninput="parseCount('keys-${t.id}','parse-${t.id}')"></textarea>
+          <span class="muted" id="parse-${t.id}" style="min-width:86px"></span>
+          <button class="btn" onclick="addKeys('${t.id}')">追加密钥</button>
+          <button class="btn ghost" onclick="testKey('${t.id}')">测试全部</button>
+          <button class="btn ghost" onclick="openEdit('${t.id}')">编辑</button>
+          <button class="btn ghost" onclick="toggleTarget('${t.id}',${t.enabled!==false})">${t.enabled===false?'启用渠道':'禁用渠道'}</button>
+          <button class="btn danger" onclick="delTarget('${t.id}')">删除渠道</button>
+        </div>
+        <div class="section-title">🔐 专属 Key（填到 Agent 里，请求只会路由到本渠道）</div>
+        ${(t.gatewayKeys||[]).length ? `<table>
+          <tr><th>Key（点击复制）</th><th>状态</th><th>请求/成功/失败</th><th>最近使用</th><th>操作</th></tr>
+          ${gwHtml}</table>` : '<div class="empty" style="padding:10px">还没有专属 Key</div>'}
+        <div class="row" style="margin-top:8px">
+          <input id="gk-note-${t.id}" placeholder="备注（可选）" style="width:150px">
+          <input id="gk-key-${t.id}" placeholder="自定义 Key（留空 = 自动生成 kp-渠道名-xxx）" style="flex:1;min-width:220px">
+          <button class="btn" onclick="addGatewayKey('${t.id}')">＋ 生成 / 添加</button>
+          <button class="btn ghost" onclick="copyChannelConfig('${t.id}')">复制接入配置</button>
+        </div>
+        <div class="section-title">🧊 模型池（测试 / 加密钥时自动从上游拉取；点模型名复制）</div>
+        <div class="row" style="margin-top:2px;align-items:center">
+          <span class="muted">${(t.models||[]).length ? `共 ${(t.models||[]).length} 个 · 更新于 ${t.modelsUpdatedAt ? fmtTime(t.modelsUpdatedAt) : '—'}${t.modelsNote ? ' · ' + esc(t.modelsNote) : ''}` : (t.modelsNote ? esc(t.modelsNote) : '还没有模型池，点「刷新模型池」或「测试全部」自动拉取')}</span>
+          <span class="grow"></span>
+          <button class="btn ghost small" onclick="refreshModels('${t.id}')">刷新模型池</button>
+        </div>
+        ${(t.models||[]).length ? `<div class="model-pool">${(t.models||[]).map((m) => {
+          const nonchat = m.mode && m.mode !== 'llm';
+          return `<span class="mp${nonchat ? ' nonchat' : ''}" title="${esc(m.desc || m.mode || m.id)}" onclick="copyText('${esc(m.id)}')">${esc(m.id)}${nonchat ? `<em>${esc(m.mode)}</em>` : ''}</span>`;
+        }).join('')}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  for (const id in saved) { const el = document.getElementById(id); if (el && el.value !== saved[id]) el.value = saved[id]; }
+  if (focusId) {
+    const el = document.getElementById(focusId);
+    if (el) {
+      el.focus();
+      if (typeof el.setSelectionRange === 'function') { try { el.setSelectionRange(selStart, selEnd); } catch (e) {} }
+    }
+  }
+}
+
+/* ---------------- 渠道操作 ---------------- */
+async function addTarget() {
+  const name = $('ntName').value.trim(), base = $('ntBase').value.trim();
+  if (!base) return toast('请填写 Base URL', true);
+  const body = { name: name || base.replace(/^https?:\/\//,'').split('/')[0], baseUrl: base, type: $('ntType').value, note: $('ntNote').value, keys: $('ntKeys').value };
+  const r = await api('/admin/api/targets', { method: 'POST', body: JSON.stringify(body) });
+  $('ntName').value = ''; $('ntBase').value = ''; $('ntKeys').value = ''; $('ntNote').value = '';
+  toast(`渠道已创建${r.target.keys.length ? '，导入 ' + r.target.keys.length + ' 个密钥' : ''}`);
+  refreshAll();
+}
+async function addKeys(id) {
+  const v = $('keys-' + id).value;
+  if (!v.trim()) return toast('请输入密钥', true);
+  const r = await api(`/admin/api/targets/${id}/keys`, { method: 'POST', body: JSON.stringify({ keys: v }) });
+  toast(`追加 ${r.added} 个密钥`);
+  refreshAll();
+}
+function parseCount(taId, spanId) {
+  const lines = $(taId).value.split(/\r?\n/).map((x) => x.trim()).filter((x) => x && !x.startsWith('#') && !x.startsWith('//'));
+  $(spanId).textContent = lines.length ? `识别 ${lines.length} 个` : '';
+}
+async function copyChannelConfig(tid) {
+  const t = targets.find((x) => x.id === tid);
+  if (!t) return;
+  const gks = (t.gatewayKeys || []).filter((g) => g.enabled !== false);
+  const gkTip = gks.length ? gks[0].key : '（尚未生成专属 Key，生成后替换）';
+  const cfg = `# 渠道「${t.name}」接入配置
+BASE_URL = "${location.origin}/v1"
+API_KEY  = "${gkTip}"
+
+# OpenAI SDK（Python）
+from openai import OpenAI
+client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+
+# 该渠道类型：${t.type}${t.baseUrl ? `
+# 上游地址：${t.baseUrl}` : ''}${t.type === 'openai' && t.acceptAnthropic ? `
+# 本渠道已开启 Anthropic 协议：可填 ANTHROPIC_BASE_URL = "${location.origin}"（端点 /v1/messages）` : ''}
+# 模型池（${(t.models||[]).length} 个，客户端取模型直接用上面的 GET /v1/models）
+${(t.models||[]).map((m) => `#   - ${m.id}${m.mode && m.mode !== 'llm' ? `（${m.mode}，非对话）` : ''}`).join('\n')}
+# 用此专属 Key 的请求只会路由到本渠道`;
+  try {
+    await navigator.clipboard.writeText(cfg);
+    toast('接入配置已复制到剪贴板');
+  } catch {
+    toast('复制失败，请手动复制：' + cfg.split('\n').slice(0, 3).join(' | '), true);
+  }
+}
+async function updateKey(tid, kid, patch) {
+  await api(`/admin/api/targets/${tid}/keys/${kid}`, { method: 'PATCH', body: JSON.stringify(patch) });
+  if (patch.enabled !== undefined) toast(patch.enabled ? '已启用（冷却已重置）' : '已禁用');
+  refreshAll();
+}
+async function delKey(tid, kid) {
+  if (!confirm('确定删除该密钥？')) return;
+  await api(`/admin/api/targets/${tid}/keys/${kid}`, { method: 'DELETE' });
+  refreshAll();
+}
+async function addGatewayKey(tid) {
+  const body = { note: $('gk-note-' + tid).value.trim(), key: $('gk-key-' + tid).value.trim() };
+  try {
+    const r = await api(`/admin/api/targets/${tid}/gateway-keys`, { method: 'POST', body: JSON.stringify(body) });
+    $('gk-note-' + tid).value = ''; $('gk-key-' + tid).value = '';
+    toast('专属 Key 已生成：' + r.record.key);
+    openedTargets.add(tid);
+    await refreshAll();
+    copyText(r.record.key);
+  } catch (e) { toast(e.message, true); }
+}
+async function updateGatewayKey(tid, gid, patch) {
+  await api(`/admin/api/targets/${tid}/gateway-keys/${gid}`, { method: 'PATCH', body: JSON.stringify(patch) });
+  refreshAll();
+}
+async function regenGatewayKey(tid, gid) {
+  if (!confirm('重新生成后旧 Key 立即失效，Agent 需更换新 Key。确定？')) return;
+  try {
+    const r = await api(`/admin/api/targets/${tid}/gateway-keys/${gid}`, { method: 'PATCH', body: JSON.stringify({ regenerate: true }) });
+    toast('新 Key：' + r.record.key);
+    await refreshAll();
+    copyText(r.record.key);
+  } catch (e) { toast(e.message, true); }
+}
+async function delGatewayKey(tid, gid) {
+  if (!confirm('确定删除该专属 Key？使用它的 Agent 将无法访问。')) return;
+  await api(`/admin/api/targets/${tid}/gateway-keys/${gid}`, { method: 'DELETE' });
+  refreshAll();
+}
+function openPwd() { $('pwdOld').value = ''; $('pwdNew').value = ''; $('pwdNew2').value = ''; $('pwdMask').classList.add('show'); setTimeout(() => $('pwdOld').focus(), 50); }
+function closePwd() { $('pwdMask').classList.remove('show'); }
+async function doChangePwd() {
+  const oldPassword = $('pwdOld').value, newPassword = $('pwdNew').value, p2 = $('pwdNew2').value;
+  if (!oldPassword) return toast('请输入当前密码', true);
+  if (newPassword.length < 6) return toast('新密码至少 6 位', true);
+  if (newPassword !== p2) return toast('两次输入的新密码不一致', true);
+  try {
+    const r = await api('/admin/api/password', { method: 'POST', body: JSON.stringify({ oldPassword, newPassword }) });
+    TOKEN = r.token;
+    localStorage.setItem('kp_token', TOKEN);
+    closePwd();
+    toast('✅ 管理密码已修改');
+  } catch (e) { toast(e.message, true); }
+}
+async function delTarget(id) {
+  if (!confirm('确定删除该渠道及其全部密钥？')) return;
+  await api(`/admin/api/targets/${id}`, { method: 'DELETE' });
+  refreshAll();
+}
+async function toggleTarget(id, cur) {
+  await api(`/admin/api/targets/${id}`, { method: 'PUT', body: JSON.stringify({ enabled: !cur }) });
+  refreshAll();
+}
+async function testKey(tid, kid) {
+  toast('测试中…');
+  try {
+    const r = await api(`/admin/api/targets/${tid}/test`, { method: 'POST', body: JSON.stringify(kid ? { keyId: kid } : {}) });
+    const okN = r.results.filter((x) => x.ok).length;
+    const lines = r.results.map((x) => `${x.keyMask}：${x.ok ? '✅' : '❌ ' + x.message}（${x.latencyMs}ms）`).join('\n');
+    const mline = r.models && r.models.length ? `\n\n模型池已更新：${r.models.length} 个模型${r.modelsNote ? '（' + r.modelsNote + '）' : ''}` : '';
+    alert(`测试完成：${okN}/${r.results.length} 可用\n\n${lines}${mline}`);
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+async function refreshModels(tid) {
+  toast('正在拉取上游模型…');
+  try {
+    const r = await api(`/admin/api/targets/${tid}/models/refresh`, { method: 'POST' });
+    toast(`模型池已更新：${(r.models || []).length} 个模型${r.note ? '（' + r.note + '）' : ''}`);
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+function openEdit(id) {
+  const t = targets.find((x) => x.id === id); if (!t) return;
+  editId = id;
+  $('etName').value = t.name; $('etType').value = t.type; $('etBase').value = t.baseUrl;
+  $('etTestModel').value = t.testModel || ''; $('etNote').value = t.note || '';
+  $('etAcceptAnthr').checked = !!t.acceptAnthropic;
+  $('etAcceptAnthr').closest('.field').style.display = t.type === 'openai' ? '' : 'none';
+  $('etChatOnly').checked = t.chatOnly !== false;
+  $('editMask').classList.add('show');
+}
+function closeEdit() { $('editMask').classList.remove('show'); }
+async function saveEdit() {
+  await api(`/admin/api/targets/${editId}`, { method: 'PUT', body: JSON.stringify({ name: $('etName').value, type: $('etType').value, baseUrl: $('etBase').value, testModel: $('etTestModel').value, note: $('etNote').value, acceptAnthropic: $('etType').value === 'openai' ? $('etAcceptAnthr').checked : false, chatOnly: $('etChatOnly').checked }) });
+  closeEdit(); toast('已保存'); refreshAll();
+}
+
+/* ---------------- 设置 ---------------- */
+async function loadSettings() {
+  const r = await api('/admin/api/settings');
+  const s = r.settings;
+  $('sStrategy').value = s.rotationStrategy || 'round-robin';
+  $('sRate').value = s.rateCooldownSeconds; $('sServer').value = s.serverCooldownSeconds;
+  $('sNetwork').value = s.networkCooldownSeconds; $('sBilling').value = s.billingCooldownMinutes;
+  $('sMaxAttempts').value = s.maxAttempts; $('sTimeout').value = s.requestTimeoutSeconds;
+  $('sIdle').value = s.streamIdleTimeoutSeconds; $('sBillingKw').value = s.billingKeywords;
+  $('sMaxBody').value = s.maxBodyMB;
+  $('sMaxC').value = s.maxConcurrentPerKey || 0;
+  $('sApiKeys').value = '';
+  $('sApiKeys').placeholder = r.hasApiKeys ? '（已设置，输入新值将整体替换；留空保持不变）' : '留空 = 客户端无需密钥即可调用';
+}
+async function saveSettings() {
+  const body = {
+    rotationStrategy: $('sStrategy').value,
+    rateCooldownSeconds: +$('sRate').value, serverCooldownSeconds: +$('sServer').value,
+    networkCooldownSeconds: +$('sNetwork').value, billingCooldownMinutes: +$('sBilling').value,
+    maxAttempts: +$('sMaxAttempts').value, requestTimeoutSeconds: +$('sTimeout').value,
+    streamIdleTimeoutSeconds: +$('sIdle').value, billingKeywords: $('sBillingKw').value,
+    maxBodyMB: +$('sMaxBody').value,
+    maxConcurrentPerKey: Math.max(0, +$('sMaxC').value || 0),
+  };
+  const ak = $('sApiKeys').value.trim();
+  if (ak) body.apiKeys = ak.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  await api('/admin/api/settings', { method: 'PUT', body: JSON.stringify(body) });
+  toast('设置已保存'); loadSettings();
+}
+async function exportConfig() {
+  try {
+    const data = await api('/admin/api/export');
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'keypool-config-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    toast('配置已导出（含密钥，请妥善保管）');
+  } catch (e) { toast(e.message, true); }
+}
+async function importConfig(input) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  const text = await f.text();
+  input.value = '';
+  if (!confirm('导入将覆盖当前全部渠道与设置（管理密码保持不变），确定继续？')) return;
+  try {
+    const r = await api('/admin/api/import', { method: 'POST', body: text });
+    toast(`导入成功：${r.targets} 个渠道`);
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ---------------- 日志 ---------------- */
+async function loadLogs() {
+  try {
+    const r = await api('/admin/api/logs');
+    $('logList').innerHTML = r.logs.length
+      ? r.logs.map((l) => `<div class="log-line ${l.level}"><span class="t">${l.time}</span><span class="m">${esc(l.msg)}</span></div>`).join('')
+      : '<div class="empty">暂无日志</div>';
+  } catch {}
+}
+
+/* ---------------- Tab ---------------- */
+let curTab = 'targets';
+function switchTab(name) {
+  curTab = name;
+  document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+  for (const t of ['targets', 'settings', 'logs', 'help']) $('tab-' + t).style.display = t === name ? '' : 'none';
+  if (name === 'settings') loadSettings();
+  if (name === 'logs') loadLogs();
+  if (name === 'help') renderHelp();
+}
+
+function renderHelp() {
+  $('helpCode').textContent = `# OpenAI SDK（Python）
+from openai import OpenAI
+client = OpenAI(base_url="http://${location.host}/v1", api_key="网关密钥(未设置则任意)")
+r = client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":"hi"}])
+
+# curl
+curl http://${location.host}/v1/chat/completions \\
+  -H "Authorization: Bearer 网关密钥" -H "Content-Type: application/json" \\
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+
+# Anthropic 协议
+curl http://${location.host}/v1/messages \\
+  -H "x-api-key: 网关密钥" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \\
+  -d '{"model":"claude-3-5-sonnet-20241022","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'`;
+  const sc = $('helpScopedCode');
+  if (sc) sc.textContent = `# 渠道专属 Key 示例（在渠道卡片里生成，形如 kp-tierflow-a1b2c3d4e5f6）
+# 只有该专属 Key 时，请求被锁定路由到对应渠道
+curl http://${location.host}/v1/chat/completions \\
+  -H "Authorization: Bearer kp-tierflow-a1b2c3d4e5f6" -H "Content-Type: application/json" \\
+  -d '{"model":"该渠道提供的模型","messages":[{"role":"user","content":"hi"}]}'
+# 专属 Key 的请求/成功/失败会单独统计在该 Key 所在行`;
+}
+
+function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('已复制')); }
+
+$('loginPwd').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeEdit(); closePwd(); } });
+$('pwdMask').addEventListener('click', (e) => { if (e.target === $('pwdMask')) closePwd(); });
+
+/* ---------------- 启动 ---------------- */
+(async function init() {
+  try {
+    const r = await fetch('/health');
+    const j = await r.json();
+    $('verBadge').textContent = 'v' + (j.version || '1.0');
+  } catch {}
+  if (TOKEN) {
+    try { await api('/admin/api/overview'); enterApp(); return; } catch {}
+  }
+  try {
+    const r = await fetch('/admin/api/settings').then((x) => x.json()).catch(() => null);
+    if (r && r.error && r.error.code === 'setup_required') { $('loginHint').textContent = '首次使用：请设置管理密码（至少 6 位）'; $('loginTitle').textContent = '初始化 KeyPool'; }
+  } catch {}
+  showLogin();
+})();
+</script>
+</body>
+</html>
