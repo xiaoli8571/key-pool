@@ -523,7 +523,13 @@ const keyStates = new Map();
 
 function entryStatus(e) {
   if (!e.enabled || e.status === 'disabled') return 'disabled';
-  if (e.coolingUntil > now() || e.status === 'cooling') return 'cooling';
+  // 冷却到期自动复位：status='cooling' 但冷却时刻已过 → 回到 ok（否则该 Key 永久滞留冷却态，只能手动重启用）
+  if (e.status === 'cooling' && e.coolingUntil <= now()) {
+    e.status = 'ok';
+    e.coolingUntil = 0;
+    e.failStreak = 0;
+  }
+  if (e.coolingUntil > now()) return 'cooling';
   return 'ok';
 }
 
@@ -1365,9 +1371,52 @@ async function pumpStream(h, req, r, c, started) {
 
 /* ------------------------------ 管理后台 API ------------------------------ */
 
+/* 登录失败限流（内存滑动窗口）：同一来源 15 分钟内失败 ≥5 次 → 锁 15 分钟。
+ * 只拦 /admin/login，不影响网关；进程重启即清零。 */
+const LOGIN_WINDOW_MS = 15 * 60000;
+const LOGIN_MAX_FAILS = 5;
+const loginFails = new Map(); // source -> { fails: number[], lockedUntil }
+function loginSource(req) {
+  const xf = req.headers['x-forwarded-for'];
+  if (xf) return String(xf).split(',')[0].trim().slice(0, 64);
+  return req.socket && req.socket.remoteAddress ? String(req.socket.remoteAddress).slice(0, 64) : 'unknown';
+}
+function loginLocked(src) {
+  const rec = loginFails.get(src);
+  if (!rec) return 0;
+  if (rec.lockedUntil > now()) return Math.ceil((rec.lockedUntil - now()) / 1000);
+  return 0;
+}
+function recordLoginFail(src) {
+  let rec = loginFails.get(src);
+  if (!rec) {
+    rec = { fails: [], lockedUntil: 0 };
+    loginFails.set(src, rec);
+  }
+  rec.fails = rec.fails.filter((t) => t > now() - LOGIN_WINDOW_MS);
+  rec.fails.push(now());
+  if (rec.fails.length >= LOGIN_MAX_FAILS) {
+    rec.lockedUntil = now() + LOGIN_WINDOW_MS;
+    rec.fails = [];
+    addLog('warn', `来源 ${src} 登录连续失败 ${LOGIN_MAX_FAILS} 次，锁定 15 分钟`);
+  }
+  if (loginFails.size > 1000) {
+    for (const [k, v] of loginFails) if (v.lockedUntil <= now() && !v.fails.length) loginFails.delete(k);
+  }
+}
+function clearLoginFails(src) {
+  loginFails.delete(src);
+}
+
 async function handleAdmin(h, req, url, pathname) {
   // 登录 / 初始化
   if (pathname === '/admin/login' && req.method === 'POST') {
+    const src = loginSource(req);
+    const lockSec = loginLocked(src);
+    if (lockSec > 0) {
+      addLog('warn', `来源 ${src} 登录被限流，剩余 ${lockSec}s`);
+      return sendError(h, 429, 'too_many_attempts', `尝试次数过多，请 ${lockSec} 秒后再试`, { 'retry-after': String(lockSec) });
+    }
     let body;
     try {
       body = JSON.parse((await readRequestBody(req, 1)).toString('utf8') || '{}');
@@ -1380,11 +1429,14 @@ async function handleAdmin(h, req, url, pathname) {
       state.adminPasswordHash = sha256('kp:' + pwd);
       saveState(true);
       addLog('info', '管理密码已设置');
+      clearLoginFails(src);
       return sendJSON(h, 200, { ok: true, token: adminTokenFor(), setup: true });
     }
     if (sha256('kp:' + pwd) !== state.adminPasswordHash) {
+      recordLoginFail(src);
       return sendError(h, 401, 'unauthorized', '密码错误');
     }
+    clearLoginFails(src);
     return sendJSON(h, 200, { ok: true, token: adminTokenFor() });
   }
 

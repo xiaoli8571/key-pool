@@ -285,6 +285,22 @@ async function main() {
     r = await jfetch(POOL + '/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'mock-model-a', messages: [{ role: 'user', content: 'hi' }] }) });
     ok(r.status === 200 && String(r.body.choices[0].message.content).includes('sk-good-a'), '重置冷却后密钥恢复服务', `key=${r.headers.get('x-keypool-key')}`);
 
+    console.log('— 冷却到期自动恢复（不做任何手动操作） —');
+    // 回归 v1.3.0 缺陷：冷却到期后 status 卡在 'cooling'，密钥被永久排除出轮换池（只能手动重启用）。
+    // 用 1s 冷却基数快速验证：触发 429 → 等 1.6s → 密钥应自动回到 'ok' 并被再次选中。
+    await jfetch(POOL + '/admin/api/settings', { method: 'PUT', headers: ah, body: JSON.stringify({ rateCooldownSeconds: 1 }) });
+    await jfetch(POOL + `/admin/api/targets/${t1}/keys/${kid('sk-good-b')}`, { method: 'PATCH', headers: ah, body: JSON.stringify({ enabled: true }) });
+    r = await jfetch(POOL + '/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'fail429-auto', messages: [{ role: 'user', content: 'hi' }] }) });
+    ok(r.status === 502, 'fail429 请求触发全部可用密钥冷却（502）', `status=${r.status}`);
+    await sleep(1600);
+    st = (await jfetch(POOL + '/admin/api/keystates', { headers: ah })).body.states;
+    const autoB = st.find((x) => x.keyId === kid('sk-good-b'));
+    const autoA = st.find((x) => x.keyId === kid('sk-good-a'));
+    ok(autoB.status === 'ok' && autoA.status === 'ok', '冷却到期后密钥状态自动复位为 ok（未手动重启用）', JSON.stringify({ b: autoB.status, a: autoA.status }));
+    r = await jfetch(POOL + '/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'mock-model-a', messages: [{ role: 'user', content: 'hi' }] }) });
+    ok(r.status === 200, '自动恢复后请求正常成功（密钥重回轮换池）', `status=${r.status}`);
+    await jfetch(POOL + '/admin/api/settings', { method: 'PUT', headers: ah, body: JSON.stringify({ rateCooldownSeconds: 8 }) });
+
     console.log('— 5xx 短冷却轮换 —');
     // 重置 flaky 冷却（重新启用即重置），flaky 优先级最高 → 先试 flaky(500) → 轮换到 good-a 成功
     await jfetch(POOL + `/admin/api/targets/${t1}/keys/${kid('sk-flaky')}`, { method: 'PATCH', headers: ah, body: JSON.stringify({ enabled: true }) });
