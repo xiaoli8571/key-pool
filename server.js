@@ -7,17 +7,21 @@
  * - 故障自动轮换：429 / 5xx / 超时 / 网络错误自动切换下一个可用 Key
  * - 冷却熔断：429 按指数退避冷却；401/403 自动禁用；欠费类错误自动冷却
  * - 流式透传：SSE（data: 分块）与 usage 统计兼容
+ * - 上游连接池：keep-alive 长连接 + DNS 缓存 + 压缩响应透明解压，热路径首字更快
  * - 内置 Web 管理后台 + 统计 + 日志
  * 零第三方依赖，Node >= 18。
  */
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
 const { Readable } = require('stream');
 const net = require('net');
+const zlib = require('zlib');
+const dns = require('dns');
 
 /* ------------------------------ 启动参数 / 环境变量 ------------------------------ */
 
@@ -251,8 +255,36 @@ function readRequestBody(req, maxMB) {
 }
 
 async function readBodySafely(res, maxBytes) {
-  // res: fetch 的 web Response 对象；带大小上限地读取文本
+  // 带大小上限地读取响应体为文本；兼容 fetch 的 web Response 与自研连接池的 Node 流
   const limit = maxBytes || 512 * 1024;
+  if (res && typeof res.on === 'function' && typeof res.resume === 'function') {
+    return new Promise((resolve) => {
+      const chunks = [];
+      let size = 0;
+      let done = false;
+      const part = () => Buffer.concat(chunks).toString('utf8');
+      const finish = (txt) => {
+        if (!done) {
+          done = true;
+          resolve(txt);
+        }
+      };
+      res.on('data', (c) => {
+        if (done) return;
+        size += c.length;
+        chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+        if (size > limit) {
+          done = true;
+          try {
+            res.destroy();
+          } catch {}
+          resolve(part() + '…(truncated)');
+        }
+      });
+      res.on('end', () => finish(part()));
+      res.on('error', () => finish(part()));
+    });
+  }
   if (!res || !res.body) {
     try {
       return String((await res.text()) || '');
@@ -806,45 +838,220 @@ function upstreamHeaders(t, keyRec, req, provider, bodyBuf, pathname) {
 
 /* ------------------------------ 转发核心 ------------------------------ */
 
-function isStreamingRequest(bodyBuf) {
-  const j = safeJSON(bodyBuf.toString('utf8'));
-  return !!(j && (j.stream === true || j.stream === 'true'));
-}
+/* ------------------------------ 上游连接池 ------------------------------
+ * fetch（undici 全局连接池）默认只保活 4s：聊天场景间隔一超，每次请求都要重付
+ * 上游 TCP+TLS 握手（实测 25~400ms）。这里用自带 keep-alive 的 Agent 常驻连接：
+ * - 连接复用：热路径省掉握手，首字延迟显著下降
+ * - DNS 缓存 120s：新建连接不再每次查域名
+ * - 复用 socket 偶发被上游断开（ECONNRESET/EPIPE）时换新连接透明重试一次
+ * - 连接建立独立 10s 超时（KEYPOOL_CONNECT_TIMEOUT 可调），死上游快速轮换
+ * - 响应带 gzip/deflate/br 时透明解压，转发给客户端的始终是明文字节
+ */
 
-function passthroughReqHeaders(req) {
-  const out = {};
-  for (const [k, v] of Object.entries(req.headers)) {
-    const lk = k.toLowerCase();
-    if (['host', 'connection', 'content-length', 'authorization', 'x-api-key', 'x-goog-api-key', 'cookie', 'x-admin-token'].includes(lk)) continue;
-    if (lk.startsWith('sec-') || lk.startsWith('proxy-')) continue;
-    out[k] = v;
+const CONNECT_TIMEOUT_MS = clampInt(process.env.KEYPOOL_CONNECT_TIMEOUT, 1000, 120000, 10000);
+
+const dnsCache = new Map(); // "host|family|all" -> { addr, family, until }
+function cachedLookup(hostname, options, callback) {
+  if (typeof options === 'function') {
+    callback = options;
+    options = {};
   }
-  return out;
+  options = options || {};
+  const fam = options.family || 0;
+  const all = !!options.all;
+  // autoSelectFamily（Node ≥20 默认开）用 all:true 调 lookup，回调要求数组形状；两种形状都要支持
+  const cacheKey = hostname + '|' + fam + '|' + (all ? 1 : 0);
+  const hit = dnsCache.get(cacheKey);
+  if (hit && hit.until > now()) {
+    process.nextTick(callback, null, hit.addr, hit.family);
+    return;
+  }
+  const req = { family: fam || 0 };
+  if (all) req.all = true;
+  if (options.hints) req.hints = options.hints;
+  dns.lookup(hostname, req, (err, addr, family) => {
+    if (!err && addr) {
+      if (dnsCache.size > 500) for (const [k, v] of dnsCache) if (v.until <= now()) dnsCache.delete(k);
+      dnsCache.set(cacheKey, { addr, family, until: now() + 120000 });
+    }
+    callback(err, addr, family);
+  });
 }
 
-async function tryUpstream(t, keyRec, provider, req, bodyBuf, pathname) {
+const upstreamAgentOpts = {
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 256,
+  maxFreeSockets: 32,
+  scheduling: 'lifo',
+  lookup: cachedLookup,
+};
+const upstreamAgentHttp = new http.Agent(upstreamAgentOpts);
+const upstreamAgentHttps = new https.Agent(upstreamAgentOpts);
+
+/* 上游 URL 校验：仅允许 http/https 且必须带主机名（上游地址来自渠道配置） */
+function safeUpstreamURL(urlStr) {
+  let u;
+  try {
+    u = new URL(urlStr);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (!u.hostname) return null;
+  return u;
+}
+
+function upstreamRequest(urlStr, opts) {
+  return new Promise((resolve) => {
+    const u = safeUpstreamURL(urlStr);
+    if (!u) {
+      resolve({ ok: false, kind: 'network', note: 'invalid upstream url' });
+      return;
+    }
+    const isHttps = u.protocol === 'https:';
+    const reqOpts = {
+      hostname: u.hostname,
+      port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname + u.search,
+      method: opts.method || 'GET',
+      headers: opts.headers || {},
+      agent: isHttps ? upstreamAgentHttps : upstreamAgentHttp,
+    };
+    let settled = false;
+    let resSeen = false;
+    let retryLeft = 1; // 复用 socket 被上游提前断开时，换新连接重试一次
+    let curConnTimer = null;
+    const clearConnTimer = () => {
+      if (curConnTimer) {
+        clearTimeout(curConnTimer);
+        curConnTimer = null;
+      }
+    };
+    const ctrl = { aborted: false, abort() {} };
+    const settleErr = (kind, note) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, kind, note: String(note || '').slice(0, 300) });
+    };
+    const settleRes = (payload) => {
+      if (settled) return;
+      settled = true;
+      resolve(payload);
+    };
+
+    const attempt = () => {
+      let reqOut;
+      try {
+        reqOut = (isHttps ? https : http).request(reqOpts, onRes);
+      } catch (e) {
+        settleErr('network', e.message);
+        return;
+      }
+      ctrl.abort = (msg) => {
+        ctrl.aborted = true;
+        try {
+          reqOut.destroy(new Error(msg || 'aborted'));
+        } catch {}
+      };
+      reqOut.on('socket', (sock) => {
+        try {
+          sock.setNoDelay(true);
+        } catch {}
+        if (sock.connecting) {
+          // 新建连接：握手完成后解除连接超时；复用的保活 socket 不会再触发 connect，
+          // 也不要在上面挂 once 监听（否则随复用次数累积触发 MaxListeners）
+          sock.once(isHttps ? 'secureConnect' : 'connect', () => clearConnTimer());
+        } else {
+          clearConnTimer();
+        }
+      });
+      curConnTimer = setTimeout(() => {
+        reqOut.destroy(new Error('connect timeout'));
+      }, CONNECT_TIMEOUT_MS);
+      reqOut.setTimeout(opts.timeoutMs || 300000, () => {
+        reqOut.destroy(new Error('upstream timeout'));
+      });
+      reqOut.on('error', (e) => {
+        clearConnTimer();
+        const code = e && e.code;
+        const msg = String((e && e.message) || e);
+        if (resSeen || settled) return;
+        if (retryLeft > 0 && reqOut.reusedSocket && !ctrl.aborted && (code === 'ECONNRESET' || code === 'EPIPE')) {
+          retryLeft = 0;
+          attempt();
+          return;
+        }
+        settleErr(/timeout/i.test(msg) ? 'timeout' : 'network', msg);
+      });
+      const body = opts.bodyBuf;
+      if (body && body.length && reqOpts.method !== 'GET' && reqOpts.method !== 'HEAD') reqOut.end(body);
+      else reqOut.end();
+    };
+
+    const onRes = (res) => {
+      resSeen = true;
+      clearConnTimer();
+      // 透明解压：网关转发给客户端的始终是明文字节（旧 fetch 行为一致）
+      const enc = String((res.headers && res.headers['content-encoding']) || '')
+        .trim()
+        .toLowerCase();
+      let stream = res;
+      if (enc === 'gzip' || enc === 'x-gzip' || enc === 'deflate' || enc === 'br') {
+        const dz = enc === 'br' ? zlib.createBrotliDecompress() : enc === 'deflate' ? zlib.createInflate() : zlib.createGunzip();
+        stream = res.pipe(dz);
+        stream.on('error', () => {
+          try {
+            res.destroy();
+          } catch {}
+        });
+      }
+      res.on('error', () => {});
+      stream.body = stream; // 与 fetch Response.body 对齐：真值 + 可异步迭代
+      const shimMap = {};
+      for (const [k, v] of Object.entries(res.headers || {})) {
+        shimMap[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : String(v);
+      }
+      if (stream !== res) {
+        delete shimMap['content-encoding'];
+        delete shimMap['content-length'];
+      }
+      const headers = {
+        get(n) {
+          const v = shimMap[String(n).toLowerCase()];
+          return v === undefined ? null : v;
+        },
+      };
+      settleRes({ ok: true, status: res.statusCode, res: stream, headers, ctrl, url: urlStr });
+    };
+
+    attempt();
+  });
+}
+
+async function tryUpstream(t, keyRec, provider, req, bodyBuf, pathname, mode) {
   const url = upstreamURL(t, provider, pathname);
   const headers = upstreamHeaders(t, keyRec, req, provider, bodyBuf, pathname);
+  // 流式请求向上游要 identity（SSE 不压缩，首字节零解压开销）；非流式允许压缩减小传输体积
+  headers['accept-encoding'] = mode === 'raw' ? 'identity' : 'gzip, deflate, br';
   const timeoutMs = clampInt(state.settings.requestTimeoutSeconds, 1, 3600, 300) * 1000;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error('upstream timeout')), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: req.method,
-      headers,
-      body: req.method === 'GET' || req.method === 'HEAD' ? undefined : bodyBuf,
-      signal: ctrl.signal,
-    });
-    return { ok: true, status: res.status, res, headers: res.headers, ctrl, url };
-  } catch (e) {
-    const isTimeout = e && (e.name === 'AbortError' || /timeout/i.test(String((e.cause && e.cause.message) || e.message || '')));
-    return {
-      ok: false,
-      kind: isTimeout ? 'timeout' : 'network',
-      note: String((e && e.message) || e).slice(0, 300),
-    };
-  } finally {
-    clearTimeout(timer);
+  let target = url;
+  for (let hop = 0; hop < 2; hop++) {
+    const r = await upstreamRequest(target, { method: req.method, headers, bodyBuf, timeoutMs });
+    if (!(r.ok && [301, 302, 307, 308].includes(r.status) && hop === 0)) return r;
+    const loc = r.headers.get('location');
+    if (!loc) return r;
+    let next;
+    try {
+      next = new URL(loc, target);
+    } catch {
+      return r;
+    }
+    if (next.origin !== new URL(target).origin) return r; // 不跨域跟随，避免把鉴权头带去第三方
+    try {
+      r.res.destroy();
+    } catch {}
+    target = next.toString();
   }
 }
 
@@ -856,6 +1063,25 @@ const CHAT_MODEL_MODES = new Set(['llm', 'chat']);
 function modelIsChat(m) {
   const mode = String((m && m.mode) || '').toLowerCase();
   return !mode || CHAT_MODEL_MODES.has(mode);
+}
+/* 模型池路由用的「渠道模型 ID 集合」缓存：models 数组整体替换式更新，WeakMap 按数组身份缓存，
+ * 免去每请求对全量模型列表做 O(n) 归一化字符串比较 */
+const MODEL_SET_CACHE = new WeakMap();
+function normModelId(x) {
+  return String(x || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^models\//, '');
+}
+function targetHasModel(t, want) {
+  const models = t.models || [];
+  let set = MODEL_SET_CACHE.get(models);
+  if (!set) {
+    set = new Set();
+    for (const m of models) set.add(normModelId(m && m.id));
+    MODEL_SET_CACHE.set(models, set);
+  }
+  return set.has(want);
 }
 function slimModelEntry(m) {
   const id = String((m && (m.id || m.name)) || '').slice(0, 200);
@@ -1143,13 +1369,16 @@ async function relayGateway(h, req, url, provider, pathname) {
     saveState();
   }
 
-  // 请求模型名（用于“密钥×模型”权限屏蔽过滤）：OpenAI/Anthropic 在 body.model，Gemini 在路径
-  let reqModel = '';
-  if (req.method === 'POST') {
+  // 请求体只解析一次：模型名与流式标记共用（原先同一 body 最多做 3 次全量 JSON.parse）
+  let bodyJson = null;
+  if (req.method === 'POST' && bodyBuf && bodyBuf.length) {
     try {
-      reqModel = String((JSON.parse(bodyBuf.toString('utf8')) || {}).model || '');
+      bodyJson = JSON.parse(bodyBuf.toString('utf8'));
     } catch {}
   }
+  const clientStream = !!(bodyJson && (bodyJson.stream === true || bodyJson.stream === 'true'));
+  // 请求模型名（用于“密钥×模型”权限屏蔽过滤）：OpenAI/Anthropic 在 body.model，Gemini 在路径
+  let reqModel = bodyJson && bodyJson.model ? String(bodyJson.model) : '';
   if (!reqModel) {
     const gm = /\/models\/([^/:]+)/.exec(pathname);
     if (gm) {
@@ -1167,10 +1396,8 @@ async function relayGateway(h, req, url, provider, pathname) {
   // 避免把 A 平台的模型发给 B 平台的 Key（白白多一次失败往返）。
   // 所有渠道池子里都没有该模型时保持全量轮换（池子可能过期，让上游给权威答复）。
   if (reqModel) {
-    const norm = (x) => String(x || '').trim().toLowerCase().replace(/^models\//, '');
-    const want = norm(reqModel);
-    const inPool = (t) => (t.models || []).some((m) => norm(m.id) === want);
-    const poolTargets = usable.filter(inPool);
+    const want = normModelId(reqModel);
+    const poolTargets = usable.filter((t) => targetHasModel(t, want));
     if (want && poolTargets.length && poolTargets.length < usable.length) {
       candidates = [];
       for (const t of poolTargets) for (const c of pickCandidates(t)) candidates.push(c);
@@ -1211,7 +1438,7 @@ async function relayGateway(h, req, url, provider, pathname) {
     c.entry.lastUsed = started;
     c.entry.inFlight = (c.entry.inFlight || 0) + 1;
     try {
-      const r = await tryUpstream(c.target, c.key, provider, req, bodyBuf, pathname);
+      const r = await tryUpstream(c.target, c.key, provider, req, bodyBuf, pathname, clientStream ? 'raw' : 'text');
       if (r.ok) {
         const cType = r.headers.get('content-type') || '';
         let kind = classifyFailure(r.status, '', s);
@@ -1247,7 +1474,7 @@ async function relayGateway(h, req, url, provider, pathname) {
           saveState();
         }
         addLog('info', `请求成功：${req.method} ${pathname} → ${c.target.name} ${maskKey(c.key.key)}（尝试 #${i + 1}，耗时 ${fmtMs(now() - started)}）`);
-        return await deliverUpstream(h, req, r, c, bodyBuf, provider, pathname, started);
+        return await deliverUpstream(h, req, r, c, bodyBuf, provider, pathname, started, clientStream);
       } else {
         recordFailure(c.target, c.key, c.entry, r.kind, 0, r.note);
         lastErr = { kind: r.kind, status: 0, note: r.note };
@@ -1287,7 +1514,7 @@ function recordFailure2Client(target, keyRec, entry, status) {
   entry.lastError = 'upstream ' + status + ' (passthrough)';
 }
 
-async function deliverUpstream(h, req, r, c, bodyBuf, provider, pathname, started) {
+async function deliverUpstream(h, req, r, c, bodyBuf, provider, pathname, started, clientStream) {
   const cType = r.headers.get('content-type') || '';
   const out = { 'content-type': cType || 'application/json' };
   const rid = r.headers.get('x-request-id') || r.headers.get('request-id') || r.headers.get('cf-ray') || '';
@@ -1296,10 +1523,11 @@ async function deliverUpstream(h, req, r, c, bodyBuf, provider, pathname, starte
   out['x-keypool-key'] = maskKey(c.key.key);
   out['x-keypool-attempts'] = '1';
 
-  const wantStream = state.settings.streamPassthrough && (cType.includes('text/event-stream') || isStreamingRequest(bodyBuf));
+  const wantStream = state.settings.streamPassthrough && (cType.includes('text/event-stream') || clientStream);
 
   if (wantStream && r.res.body) {
     h.writeHead(r.status, out);
+    h.flushHeaders(); // 首个上游分片到达前先把响应头发给客户端，压低首字感知延迟
     await pumpStream(h, req, r, c, started);
     return;
   }
@@ -1320,14 +1548,7 @@ async function pumpStream(h, req, r, c, started) {
       r.ctrl.abort(new Error('stream idle timeout'));
     } catch {}
   }, idleMs);
-  const resetIdle = () => {
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      try {
-        r.ctrl.abort(new Error('stream idle timeout'));
-      } catch {}
-    }, idleMs);
-  };
+  const resetIdle = () => idleTimer.refresh();
   let tailBuf = Buffer.alloc(0); // 滚动缓冲，用于流结束时解析 usage
   let clientGone = false;
   const onClose = () => {
@@ -1522,7 +1743,7 @@ async function handleAdmin(h, req, url, pathname) {
       gatewayKeyRequests: gwReq,
       gatewayKeySuccess: gwOk,
       uptimeMs: now() - bootAt,
-      version: '1.3.0',
+      version: '1.4.0',
     });
   }
 
@@ -2049,6 +2270,16 @@ const server = http.createServer(async (req, h) => {
   }
 });
 
+/* 服务端 keep-alive 延长到 65s（默认 5s）：客户端两次请求间隔一超就要重付整轮 TCP+TLS 握手，
+ * 对外网客户端这是每请求几十到几百毫秒的固定首字开销。headersTimeout 需大于 keepAliveTimeout。 */
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+server.on('connection', (sock) => {
+  try {
+    sock.setNoDelay(true);
+  } catch {}
+});
+
 /* 优雅退出 */
 function shutdown() {
   console.log('[keypool] shutting down…');
@@ -2081,7 +2312,6 @@ server.listen(PORT, HTTP_HOST, () => {
 const tlsCertPath = argValue('tls-cert') || process.env.KEYPOOL_TLS_CERT || '';
 const tlsKeyPath = argValue('tls-key') || process.env.KEYPOOL_TLS_KEY || '';
 if (tlsCertPath && tlsKeyPath) {
-  const https = require('https');
   const tlsPort = parseInt(argValue('tls-port') || process.env.KEYPOOL_TLS_PORT || '443', 10);
   const acmeWebroot = argValue('acme-webroot') || process.env.KEYPOOL_ACME_WEBROOT || '/etc/keypool/acme';
   let tlsOpts;
@@ -2093,6 +2323,13 @@ if (tlsCertPath && tlsKeyPath) {
   }
   if (tlsOpts) {
     const httpsServer = https.createServer(tlsOpts, (req, res) => server.emit('request', req, res));
+    httpsServer.keepAliveTimeout = 65000;
+    httpsServer.headersTimeout = 66000;
+    httpsServer.on('connection', (sock) => {
+      try {
+        sock.setNoDelay(true);
+      } catch {}
+    });
     httpsServer.on('error', (e) => console.error(`[keypool] HTTPS 监听失败(${tlsPort}): ${e.message}`));
     httpsServer.listen(tlsPort, HOST, () => {
       console.log(`[keypool] HTTPS 已启动: https://${HOST}:${tlsPort}`);
