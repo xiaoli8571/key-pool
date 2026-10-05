@@ -889,6 +889,25 @@ const upstreamAgentOpts = {
 const upstreamAgentHttp = new http.Agent(upstreamAgentOpts);
 const upstreamAgentHttps = new https.Agent(upstreamAgentOpts);
 
+/* 空闲 socket 回收：上游（尤其是不规范的 LB/CDN）可能对闲置连接静默丢弃且不发 RST，
+ * 复用这种半开连接会请求黑等到超时。给归还连接池的 socket 设空闲上限，
+ * 超时即销毁；活跃对话（间隔小于该值）仍能命中连接复用。
+ * 默认 45s（部分平台对新建连接有明显的排队惩罚，热连接 TTFT 快数倍），
+ * KEYPOOL_FREE_SOCKET_IDLE_MS 可调（0 = 不回收）。 */
+const FREE_SOCKET_IDLE_MS = clampInt(process.env.KEYPOOL_FREE_SOCKET_IDLE_MS, 0, 600000, 45000);
+function armFreeSocketIdle(sock) {
+  if (!FREE_SOCKET_IDLE_MS) return;
+  if (sock.__kpIdleTimer) clearTimeout(sock.__kpIdleTimer);
+  sock.__kpIdleTimer = setTimeout(() => {
+    try {
+      sock.destroy();
+    } catch {}
+  }, FREE_SOCKET_IDLE_MS);
+  if (sock.__kpIdleTimer.unref) sock.__kpIdleTimer.unref();
+}
+upstreamAgentHttp.on('free', armFreeSocketIdle);
+upstreamAgentHttps.on('free', armFreeSocketIdle);
+
 /* 上游 URL 校验：仅允许 http/https 且必须带主机名（上游地址来自渠道配置） */
 function safeUpstreamURL(urlStr) {
   let u;
@@ -902,8 +921,14 @@ function safeUpstreamURL(urlStr) {
   return u;
 }
 
-function upstreamRequest(urlStr, opts) {
-  return new Promise((resolve) => {
+/* 管理侧出站请求（密钥探测 / 模型池拉取）统一走这里：与转发主路径一致先校验 URL */
+async function guardedFetch(url, opts) {
+  const u = safeUpstreamURL(url);
+  if (!u) throw new Error('invalid upstream url');
+  return fetch(u.toString(), opts);
+}
+
+function upstreamRequest(urlStr, opts) {  return new Promise((resolve) => {
     const u = safeUpstreamURL(urlStr);
     if (!u) {
       resolve({ ok: false, kind: 'network', note: 'invalid upstream url' });
@@ -958,6 +983,10 @@ function upstreamRequest(urlStr, opts) {
         try {
           sock.setNoDelay(true);
         } catch {}
+        if (sock.__kpIdleTimer) {
+          clearTimeout(sock.__kpIdleTimer);
+          sock.__kpIdleTimer = null;
+        }
         if (sock.connecting) {
           // 新建连接：握手完成后解除连接超时；复用的保活 socket 不会再触发 connect，
           // 也不要在上面挂 once 监听（否则随复用次数累积触发 MaxListeners）
@@ -1133,7 +1162,7 @@ async function refreshTargetModels(t, timeoutMs = 20000) {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(new Error('timeout')), timeoutMs);
         try {
-          const res = await fetch(ep.url, { method: 'GET', headers, signal: ctrl.signal });
+          const res = await guardedFetch(ep.url, { method: 'GET', headers, signal: ctrl.signal });
           const text = await readBodySafely(res, 2 * 1024 * 1024);
           if (res.status >= 200 && res.status < 300) {
             const j = safeJSON(text);
@@ -1173,7 +1202,7 @@ async function refreshTargetModels(t, timeoutMs = 20000) {
   }
   t.modelsUpdatedAt = now();
   saveState();
-  // 模型池变化后让 /v1/models 的 30s 聚合缓存失效，避免旧列表掩盖新数据
+  // 模型池变化后让 /v1/models 的聚合缓存失效，避免旧列表掩盖新数据
   for (const ck of [...modelsMergeCache.keys()]) if (ck.includes(t.id + ':')) modelsMergeCache.delete(ck);
   addLog(ok ? 'info' : 'warn', `模型池刷新：${t.name} 共 ${ok ? t.models.length : (t.models || []).length} 个模型（${ok}/${ok + fail} 个密钥成功）${t.modelsNote ? ' · ' + t.modelsNote : ''}`);
   return { models: t.models || [], updatedAt: t.modelsUpdatedAt, note: t.modelsNote };
@@ -1191,9 +1220,9 @@ function maybeRefreshPool(t, force, minAgeMs = 60000) {
 
 /* /v1/models 跨密钥聚合：并发拉取各候选密钥的模型列表，按 id/name 去重合并。
  * 聚合平台的模型授权常按 Key 下发，单 Key 拉取会让客户端每次看到不同列表。
- * 30s 结果缓存（避免频繁刷新打爆上游）；全部失败时透传第一个上游错误。
+ * 2min 结果缓存（避免频繁刷新打爆上游）；全部失败时透传第一个上游错误。
  * 除 401/403（真实的密钥失效信号）外，模型列表拉取失败不影响密钥健康状态。 */
-const MODELS_MERGE_TTL = 30000;
+const MODELS_MERGE_TTL = 120000;
 const modelsMergeCache = new Map(); // cacheKey -> { until, body, targets, keys }
 
 async function deliverModelsMerged(h, candidates, provider, pathname, grec, url) {
@@ -2103,7 +2132,7 @@ async function probeKey(t, k) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(new Error('timeout')), 30000);
     try {
-      return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+      return await guardedFetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
     } finally {
       clearTimeout(timer);
     }
@@ -2156,8 +2185,8 @@ async function probeKey(t, k) {
 
 function serveStatic(h, pathname) {
   let rel = pathname === '/' || pathname === '/admin' || pathname === '/admin/' ? 'index.html' : pathname.replace(/^\/+/, '');
-  const file = path.join(PUBLIC_DIR, rel);
-  if (!file.startsWith(PUBLIC_DIR)) return sendText(h, 403, 'forbidden');
+  const file = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (file !== PUBLIC_DIR && !file.startsWith(PUBLIC_DIR + path.sep)) return sendText(h, 403, 'forbidden');
   fs.readFile(file, (err, data) => {
     if (err) return sendText(h, 404, 'Not Found');
     const ext = path.extname(file).toLowerCase();
@@ -2217,12 +2246,14 @@ const server = http.createServer(async (req, h) => {
       return await handleAdmin(h, req, url, pathname === '/admin/login' ? '/admin/login' : '/admin/api/' + pathname.slice('/admin/api/'.length).replace(/\/+$/, ''));
     }
 
-    /* CORS 预检（网关路径） */
+    /* CORS 预检（网关路径）。max-age 让浏览器缓存预检结果，
+     * 跨境/高 RTT 线路上省掉每次请求前的 OPTIONS 整轮往返 */
     if (req.method === 'OPTIONS') {
       h.writeHead(204, {
         'access-control-allow-origin': '*',
         'access-control-allow-methods': 'GET, POST, OPTIONS',
         'access-control-allow-headers': 'authorization, content-type, x-api-key, x-goog-api-key, anthropic-version, anthropic-beta',
+        'access-control-max-age': '86400',
       });
       return h.end();
     }
